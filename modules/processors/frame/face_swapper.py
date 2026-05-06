@@ -16,6 +16,7 @@ from modules.utilities import (
 )
 from modules.cluster_analysis import find_closest_centroid
 from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize, gpu_cvt_color
+from modules.low_light import apply_low_light_enhancement
 import os
 from collections import deque
 import time
@@ -381,8 +382,7 @@ def process_frame(source_face: Face, temp_frame: Frame) -> Frame:
         PREVIOUS_FRAME_RESULT = None
         return temp_frame
 
-    # Color correction removed from here (better applied before swap if needed)
-
+    temp_frame = apply_low_light_enhancement(temp_frame)
     processed_frame = temp_frame # Start with the input frame
     swapped_face_bboxes = [] # Keep track of where swaps happened
 
@@ -417,6 +417,7 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
         PREVIOUS_FRAME_RESULT = None
         return temp_frame
 
+    temp_frame = apply_low_light_enhancement(temp_frame)
     processed_frame = temp_frame # Start with the input frame
     swapped_face_bboxes = [] # Keep track of where swaps happened
 

@@ -70,4 +70,7 @@ enable_interpolation: bool = True # Toggle temporal smoothing
 interpolation_weight: float = 0  # Blend weight for current frame (0.0-1.0). Lower=smoother.
 # --- END: Added for Frame Interpolation ---
 
+# Low-light enhancement
+low_light_mode: bool = False  # Adaptive CLAHE on dark frames
+
 # --- END OF FILE globals.py ---

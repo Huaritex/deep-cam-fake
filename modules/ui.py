@@ -138,6 +138,7 @@ def save_switch_states():
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
         "mouth_mask_size": modules.globals.mouth_mask_size,
+        "low_light_mode": modules.globals.low_light_mode,
     }
     with open("switch_states.json", "w") as f:
         json.dump(switch_states, f)
@@ -163,6 +164,7 @@ def load_switch_states():
         # mouth_mask is driven by the slider: on if size > 0, off if 0
         modules.globals.mouth_mask = modules.globals.mouth_mask_size > 0
         modules.globals.show_mouth_mask_box = False  # always start hidden
+        modules.globals.low_light_mode = switch_states.get("low_light_mode", False)
     except FileNotFoundError:
         # If the file doesn't exist, use default values
         pass
@@ -287,6 +289,20 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     )
     color_correction_switch.place(relx=0.6, rely=0.57)
     ToolTip(color_correction_switch, _("Fix blue/green color cast from some webcams"))
+
+    low_light_value = ctk.BooleanVar(value=modules.globals.low_light_mode)
+    low_light_switch = ctk.CTkSwitch(
+        root,
+        text=_("Low Light"),
+        variable=low_light_value,
+        cursor="hand2",
+        command=lambda: (
+            setattr(modules.globals, "low_light_mode", low_light_value.get()),
+            save_switch_states(),
+        ),
+    )
+    low_light_switch.place(relx=0.6, rely=0.62)
+    ToolTip(low_light_switch, _("Enhance frames captured in dark / low-light rooms (adaptive CLAHE)"))
 
     #    nsfw_value = ctk.BooleanVar(value=modules.globals.nsfw_filter)
     #    nsfw_switch = ctk.CTkSwitch(root, text='NSFW filter', variable=nsfw_value, cursor='hand2', command=lambda: setattr(modules.globals, 'nsfw_filter', nsfw_value.get()))
