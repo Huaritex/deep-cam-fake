@@ -23,7 +23,15 @@ import modules.globals
 import modules.metadata
 import modules.ui as ui
 from modules.processors.frame.core import get_frame_processors_modules
-from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path
+from modules.utilities import (
+    has_image_extension, is_image, is_video,
+    detect_fps, create_video,
+    extract_frames, get_temp_frame_paths,
+    restore_audio, create_temp, move_temp, clean_temp,
+    normalize_output_path,
+    get_video_info, stream_frames_from_video, VideoFrameEncoder,
+    get_temp_output_path,
+)
 
 if HAS_TORCH and 'ROCMExecutionProvider' in modules.globals.execution_providers:
     del torch
@@ -189,6 +197,61 @@ def update_status(message: str, scope: str = 'DLC.CORE') -> None:
     if not modules.globals.headless:
         ui.update_status(message)
 
+
+def _process_video_streaming(frame_processors, fps: float) -> None:
+    """Process a video file via ffmpeg pipes — zero temp-file I/O for frames.
+
+    Streams decoded BGR frames through each processor's process_frame() and
+    feeds the results directly into an ffmpeg encoder subprocess.
+    Requires: map_faces=False and a valid target/source path in globals.
+    """
+    import cv2
+    from tqdm import tqdm
+    from modules.face_analyser import get_one_face
+
+    target_path = modules.globals.target_path
+    source_path = modules.globals.source_path
+    output_path = modules.globals.output_path
+
+    info = get_video_info(target_path)
+    width = int(info.get("width", 0))
+    height = int(info.get("height", 0))
+    if width <= 0 or height <= 0:
+        update_status("Cannot read video dimensions — falling back to disk pipeline.")
+        return None  # Signal caller to fall back
+
+    # Pre-load source face so processors don't reload it per-frame.
+    source_face = None
+    if source_path:
+        src_img = cv2.imread(source_path)
+        if src_img is not None:
+            source_face = get_one_face(src_img)
+
+    create_temp(target_path)
+    temp_output = get_temp_output_path(target_path)
+
+    total_frames = int(info.get("nb_frames") or 0) or None
+
+    update_status("Streaming frames (no disk I/O)...")
+    bar_fmt = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+    with VideoFrameEncoder(temp_output, fps, width, height) as encoder:
+        with tqdm(total=total_frames, desc='Streaming', unit='frame',
+                  dynamic_ncols=True, bar_format=bar_fmt) as progress:
+            for frame in stream_frames_from_video(target_path):
+                for proc in frame_processors:
+                    frame = proc.process_frame(source_face, frame)
+                encoder.write(frame)
+                progress.update(1)
+
+    if modules.globals.keep_audio:
+        restore_audio(target_path, output_path)
+    else:
+        move_temp(target_path, output_path)
+
+    clean_temp(target_path)
+    return True  # Success
+
+
 def start() -> None:
     """Start processing with performance monitoring."""
     import time
@@ -223,6 +286,23 @@ def start() -> None:
     if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
         return
 
+    fps = detect_fps(modules.globals.target_path) if modules.globals.keep_fps else 30.0
+    frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
+
+    # --- Streaming path: no temp-file I/O (simple mode only) ---
+    if not modules.globals.map_faces:
+        stream_start = time.time()
+        result = _process_video_streaming(frame_processors, fps)
+        if result is True:
+            total_time = time.time() - start_time
+            if is_video(modules.globals.target_path):
+                update_status(f'Processing to video succeed! Total time: {total_time:.2f}s')
+            else:
+                update_status('Processing to video failed!')
+            return
+        # Streaming failed (e.g. bad probe) — fall through to disk pipeline.
+
+    # --- Disk pipeline: extract → process → encode (map_faces or streaming fallback) ---
     extraction_start = time.time()
     if not modules.globals.map_faces:
         update_status('Creating temp resources...')
@@ -235,26 +315,19 @@ def start() -> None:
     temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
     total_frames = len(temp_frame_paths)
     update_status(f'Processing {total_frames} frames with {modules.globals.execution_threads} threads...')
-    
+
     processing_start = time.time()
-    for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
+    for frame_processor in frame_processors:
         update_status('Progressing...', frame_processor.NAME)
         frame_processor.process_video(modules.globals.source_path, temp_frame_paths)
         release_resources()
     processing_time = time.time() - processing_start
     fps_processing = total_frames / processing_time if processing_time > 0 else 0
     update_status(f'Frame processing completed in {processing_time:.2f}s ({fps_processing:.2f} fps)')
-    
-    # handles fps
+
     encoding_start = time.time()
-    if modules.globals.keep_fps:
-        update_status('Detecting fps...')
-        fps = detect_fps(modules.globals.target_path)
-        update_status(f'Creating video with {fps} fps...')
-        create_video(modules.globals.target_path, fps)
-    else:
-        update_status('Creating video with 30.0 fps...')
-        create_video(modules.globals.target_path)
+    update_status(f'Creating video with {fps} fps...')
+    create_video(modules.globals.target_path, fps)
     encoding_time = time.time() - encoding_start
     update_status(f'Video encoding completed in {encoding_time:.2f}s')
     

@@ -124,8 +124,8 @@ cd Deep-Live-Cam
 
 **3. Download the Models**
 
-1. [GFPGANv1.4](https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx)
-2. [inswapper\_128\_fp16.onnx](https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx)
+1. [GFPGANv1.4.onnx](https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx) — GFPGAN face enhancer (`GFPGANv1.4.onnx` **or** `gfpgan-1024.onnx`, both accepted)
+2. [inswapper\_128\_fp16.onnx](https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx) — face swapper model
 
 Place these files in the "**models**" folder.
 

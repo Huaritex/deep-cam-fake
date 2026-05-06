@@ -21,11 +21,38 @@ IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm6
 THREAD_SEMAPHORE = threading.Semaphore(min(max(1, (os.cpu_count() or 1)), 8))
 
 
+def _onnx_session_options() -> onnxruntime.SessionOptions:
+    """Build SessionOptions aligned with the active provider and thread count."""
+    opts = onnxruntime.SessionOptions()
+    opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.enable_mem_pattern = True
+
+    providers = modules.globals.execution_providers or []
+    gpu_providers = ("CUDAExecutionProvider", "DmlExecutionProvider",
+                     "ROCMExecutionProvider", "CoreMLExecutionProvider")
+    is_gpu = any(p in providers for p in gpu_providers)
+
+    if is_gpu:
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.enable_cpu_mem_arena = False
+    else:
+        threads = modules.globals.execution_threads or (os.cpu_count() or 4)
+        cpu_count = os.cpu_count() or 4
+        intra = max(1, cpu_count // max(1, threads))
+        opts.intra_op_num_threads = intra
+        opts.inter_op_num_threads = 1
+
+    return opts
+
+
 def create_onnx_session(model_path: str) -> onnxruntime.InferenceSession:
     """Create an ONNX Runtime session using the configured execution providers."""
-    providers = modules.globals.execution_providers
-    session = onnxruntime.InferenceSession(model_path, providers=providers)
-    return session
+    return onnxruntime.InferenceSession(
+        model_path,
+        sess_options=_onnx_session_options(),
+        providers=modules.globals.execution_providers,
+    )
 
 
 def warmup_session(session: onnxruntime.InferenceSession) -> None:

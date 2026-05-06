@@ -29,6 +29,45 @@ models_dir = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(abs_dir))), "models"
 )
 
+# Both filenames are in the wild — accept either.
+GFPGAN_MODEL_NAMES = ["gfpgan-1024.onnx", "GFPGANv1.4.onnx"]
+
+
+def _find_gfpgan_model() -> str | None:
+    for name in GFPGAN_MODEL_NAMES:
+        path = os.path.join(models_dir, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _onnx_session_options() -> onnxruntime.SessionOptions:
+    """Build SessionOptions aligned with the active provider and thread count."""
+    opts = onnxruntime.SessionOptions()
+    opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.enable_mem_pattern = True
+
+    providers = modules.globals.execution_providers or []
+    gpu_providers = ("CUDAExecutionProvider", "DmlExecutionProvider",
+                     "ROCMExecutionProvider", "CoreMLExecutionProvider")
+    is_gpu = any(p in providers for p in gpu_providers)
+
+    if is_gpu:
+        # GPU handles parallelism; CPU-side ORT threads add overhead.
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.enable_cpu_mem_arena = False
+    else:
+        threads = modules.globals.execution_threads or (os.cpu_count() or 4)
+        cpu_count = os.cpu_count() or 4
+        # Each Python worker gets a slice of CPU cores for ONNX intra-op work.
+        intra = max(1, cpu_count // max(1, threads))
+        opts.intra_op_num_threads = intra
+        opts.inter_op_num_threads = 1
+
+    return opts
+
+
 # Standard FFHQ 5-point face template for 512x512 resolution
 # Points: left_eye, right_eye, nose, left_mouth, right_mouth
 FFHQ_TEMPLATE_512 = np.array(
@@ -44,11 +83,11 @@ FFHQ_TEMPLATE_512 = np.array(
 
 
 def pre_check() -> bool:
-    model_path = os.path.join(models_dir, "gfpgan-1024.onnx")
-    if not os.path.exists(model_path):
+    model_path = _find_gfpgan_model()
+    if model_path is None:
+        names = " or ".join(GFPGAN_MODEL_NAMES)
         update_status(
-            f"GFPGAN ONNX model not found at {model_path}. "
-            "Please place gfpgan-1024.onnx in the models folder.",
+            f"GFPGAN ONNX model not found. Place {names} in the models folder.",
             NAME,
         )
         return False
@@ -73,25 +112,17 @@ def get_face_enhancer() -> onnxruntime.InferenceSession:
 
     with THREAD_LOCK:
         if FACE_ENHANCER is None:
-            model_path = os.path.join(models_dir, "gfpgan-1024.onnx")
+            model_path = _find_gfpgan_model()
 
-            if not os.path.exists(model_path):
-                raise FileNotFoundError(
-                    f"{NAME}: Model not found at {model_path}"
-                )
+            if model_path is None:
+                names = " or ".join(GFPGAN_MODEL_NAMES)
+                raise FileNotFoundError(f"{NAME}: Model not found ({names}) in {models_dir}")
 
             try:
-                providers = modules.globals.execution_providers
-
-                session_options = onnxruntime.SessionOptions()
-                session_options.graph_optimization_level = (
-                    onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-                )
-
                 FACE_ENHANCER = onnxruntime.InferenceSession(
                     model_path,
-                    sess_options=session_options,
-                    providers=providers,
+                    sess_options=_onnx_session_options(),
+                    providers=modules.globals.execution_providers,
                 )
 
                 input_info = FACE_ENHANCER.get_inputs()[0]

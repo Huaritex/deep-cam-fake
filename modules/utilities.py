@@ -1,4 +1,5 @@
 import glob
+import json
 import mimetypes
 import os
 import platform
@@ -7,8 +8,10 @@ import ssl
 import subprocess
 import urllib
 from pathlib import Path
-from typing import List, Any
+from typing import Any, Generator, List, Optional, Tuple
 from tqdm import tqdm
+
+import numpy as np
 
 import modules.globals
 
@@ -73,116 +76,180 @@ def extract_frames(target_path: str) -> None:
     )
 
 
+def _build_encoder_args(
+    encoder: str, quality: int, providers: List[str]
+) -> Tuple[str, List[str]]:
+    """Return (encoder_name, extra_ffmpeg_args) for the given provider/encoder."""
+    if "CUDAExecutionProvider" in providers:
+        if encoder == "libx264":
+            return "h264_nvenc", [
+                "-preset", "p7", "-tune", "hq", "-rc", "vbr",
+                "-cq", str(quality), "-b:v", "0", "-multipass", "fullres",
+            ]
+        if encoder == "libx265":
+            return "hevc_nvenc", [
+                "-preset", "p7", "-tune", "hq", "-rc", "vbr",
+                "-cq", str(quality), "-b:v", "0",
+            ]
+    if "DmlExecutionProvider" in providers:
+        if encoder == "libx264":
+            return "h264_amf", [
+                "-quality", "quality", "-rc", "vbr_latency",
+                "-qp_i", str(quality), "-qp_p", str(quality),
+            ]
+        if encoder == "libx265":
+            return "hevc_amf", [
+                "-quality", "quality", "-rc", "vbr_latency",
+                "-qp_i", str(quality), "-qp_p", str(quality),
+            ]
+    # CPU
+    if encoder == "libx265":
+        return encoder, ["-preset", "medium", "-crf", str(quality), "-x265-params", "log-level=error"]
+    if encoder == "libvpx-vp9":
+        return encoder, ["-crf", str(quality), "-b:v", "0", "-cpu-used", "2"]
+    return encoder, ["-preset", "medium", "-crf", str(quality), "-tune", "film"]
+
+
+_COMMON_OUTPUT_ARGS = ["-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                       "-vf", "colorspace=bt709:iall=bt601-6-625:fast=1"]
+
+
 def create_video(target_path: str, fps: float = 30.0) -> None:
-    """Create video with hardware-accelerated encoding and optimized settings."""
+    """Create video from temp PNG frames with hardware-accelerated encoding."""
     temp_output_path = get_temp_output_path(target_path)
     temp_directory_path = get_temp_directory_path(target_path)
-    
-    # Determine optimal encoder based on available hardware
-    encoder = modules.globals.video_encoder
-    encoder_options = []
-    
-    # GPU-accelerated encoding options
-    if 'CUDAExecutionProvider' in modules.globals.execution_providers:
-        # NVIDIA GPU encoding
-        if encoder == 'libx264':
-            encoder = 'h264_nvenc'
-            encoder_options = [
-                "-preset", "p7",  # Highest quality preset for NVENC
-                "-tune", "hq",  # High quality tuning
-                "-rc", "vbr",  # Variable bitrate
-                "-cq", str(modules.globals.video_quality),  # Quality level
-                "-b:v", "0",  # Let CQ control bitrate
-                "-multipass", "fullres",  # Two-pass encoding for better quality
-            ]
-        elif encoder == 'libx265':
-            encoder = 'hevc_nvenc'
-            encoder_options = [
-                "-preset", "p7",
-                "-tune", "hq",
-                "-rc", "vbr",
-                "-cq", str(modules.globals.video_quality),
-                "-b:v", "0",
-            ]
-    elif 'DmlExecutionProvider' in modules.globals.execution_providers:
-        # AMD/Intel GPU encoding (DirectML on Windows)
-        if encoder == 'libx264':
-            # Try AMD AMF encoder
-            encoder = 'h264_amf'
-            encoder_options = [
-                "-quality", "quality",  # Quality mode
-                "-rc", "vbr_latency",
-                "-qp_i", str(modules.globals.video_quality),
-                "-qp_p", str(modules.globals.video_quality),
-            ]
-        elif encoder == 'libx265':
-            encoder = 'hevc_amf'
-            encoder_options = [
-                "-quality", "quality",
-                "-rc", "vbr_latency",
-                "-qp_i", str(modules.globals.video_quality),
-                "-qp_p", str(modules.globals.video_quality),
-            ]
-    else:
-        # CPU encoding with optimized settings
-        if encoder == 'libx264':
-            encoder_options = [
-                "-preset", "medium",  # Balance speed/quality
-                "-crf", str(modules.globals.video_quality),
-                "-tune", "film",  # Optimize for film content
-            ]
-        elif encoder == 'libx265':
-            encoder_options = [
-                "-preset", "medium",
-                "-crf", str(modules.globals.video_quality),
-                "-x265-params", "log-level=error",
-            ]
-        elif encoder == 'libvpx-vp9':
-            encoder_options = [
-                "-crf", str(modules.globals.video_quality),
-                "-b:v", "0",  # Constant quality mode
-                "-cpu-used", "2",  # Speed vs quality (0-5, lower=slower/better)
-            ]
-    
-    # Build ffmpeg command
+
+    enc_name, enc_opts = _build_encoder_args(
+        modules.globals.video_encoder,
+        modules.globals.video_quality,
+        modules.globals.execution_providers,
+    )
+
     ffmpeg_args = [
         "-r", str(fps),
         "-i", os.path.join(temp_directory_path, "%04d.png"),
-        "-c:v", encoder,
+        "-c:v", enc_name,
+        *enc_opts,
+        *_COMMON_OUTPUT_ARGS,
+        "-y", temp_output_path,
     ]
-    
-    # Add encoder-specific options
-    ffmpeg_args.extend(encoder_options)
-    
-    # Add common options
-    ffmpeg_args.extend([
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",  # Enable fast start for web playback
-        "-vf", "colorspace=bt709:iall=bt601-6-625:fast=1",
-        "-y",
-        temp_output_path,
-    ])
-    
-    # Try with hardware encoder first, fallback to software if it fails
+
     success = run_ffmpeg(ffmpeg_args)
-    
-    if not success and encoder in ['h264_nvenc', 'hevc_nvenc', 'h264_amf', 'hevc_amf']:
-        # Fallback to software encoding
-        print(f"Hardware encoding with {encoder} failed, falling back to software encoding...")
-        fallback_encoder = 'libx264' if 'h264' in encoder else 'libx265'
-        ffmpeg_args_fallback = [
+
+    if not success and enc_name in ("h264_nvenc", "hevc_nvenc", "h264_amf", "hevc_amf"):
+        print(f"Hardware encoding with {enc_name} failed, falling back to software...")
+        fallback = "libx264" if "h264" in enc_name else "libx265"
+        fb_name, fb_opts = _build_encoder_args(fallback, modules.globals.video_quality, [])
+        run_ffmpeg([
             "-r", str(fps),
             "-i", os.path.join(temp_directory_path, "%04d.png"),
-            "-c:v", fallback_encoder,
-            "-preset", "medium",
-            "-crf", str(modules.globals.video_quality),
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-vf", "colorspace=bt709:iall=bt601-6-625:fast=1",
-            "-y",
-            temp_output_path,
+            "-c:v", fb_name,
+            *fb_opts,
+            *_COMMON_OUTPUT_ARGS,
+            "-y", temp_output_path,
+        ])
+
+
+# ---------------------------------------------------------------------------
+# Streaming pipeline — zero temp-file I/O for frame data
+# ---------------------------------------------------------------------------
+
+def get_video_info(video_path: str) -> dict:
+    """Return first video-stream metadata from ffprobe (empty dict on failure)."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        "-select_streams", "v:0",
+        video_path,
+    ]
+    try:
+        raw = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        streams = json.loads(raw).get("streams", [])
+        return streams[0] if streams else {}
+    except Exception:
+        return {}
+
+
+def stream_frames_from_video(video_path: str) -> Generator[np.ndarray, None, None]:
+    """Yield BGR uint8 numpy frames from *video_path* via an ffmpeg stdout pipe.
+
+    Bypasses all temp-file I/O.  Falls back gracefully on probe failure.
+    """
+    info = get_video_info(video_path)
+    width = int(info.get("width", 0))
+    height = int(info.get("height", 0))
+    if width <= 0 or height <= 0:
+        return
+
+    cmd = [
+        "ffmpeg", "-hide_banner",
+        "-hwaccel", "auto",
+        "-i", video_path,
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-vsync", "0",
+        "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    frame_bytes = width * height * 3
+    try:
+        while True:
+            raw = proc.stdout.read(frame_bytes)
+            if len(raw) < frame_bytes:
+                break
+            yield np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+    finally:
+        proc.stdout.close()
+        proc.wait()
+
+
+class VideoFrameEncoder:
+    """Context manager: encode BGR numpy frames to a video file via ffmpeg stdin pipe.
+
+    Usage::
+        with VideoFrameEncoder(path, fps, w, h) as enc:
+            for frame in frames:
+                enc.write(frame)
+    """
+
+    def __init__(self, output_path: str, fps: float, width: int, height: int) -> None:
+        self.output_path = output_path
+        self.fps = fps
+        self.width = width
+        self.height = height
+        self._proc: Optional[subprocess.Popen] = None
+
+    def __enter__(self) -> "VideoFrameEncoder":
+        enc_name, enc_opts = _build_encoder_args(
+            modules.globals.video_encoder,
+            modules.globals.video_quality,
+            modules.globals.execution_providers,
+        )
+        cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-r", str(self.fps),
+            "-s", f"{self.width}x{self.height}",
+            "-i", "pipe:0",
+            "-c:v", enc_name,
+            *enc_opts,
+            *_COMMON_OUTPUT_ARGS,
+            self.output_path,
         ]
-        run_ffmpeg(ffmpeg_args_fallback)
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return self
+
+    def write(self, frame: np.ndarray) -> None:
+        if self._proc and self._proc.stdin:
+            self._proc.stdin.write(frame.tobytes())
+
+    def __exit__(self, *_: object) -> None:
+        if self._proc:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+            self._proc.wait()
 
 
 def restore_audio(target_path: str, output_path: str) -> None:

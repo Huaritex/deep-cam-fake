@@ -1,3 +1,4 @@
+import os
 import sys
 import importlib
 from concurrent.futures import ThreadPoolExecutor
@@ -6,7 +7,7 @@ from typing import Any, List, Callable
 from tqdm import tqdm
 
 import modules
-import modules.globals                   
+import modules.globals
 
 FRAME_PROCESSORS_MODULES: List[ModuleType] = []
 FRAME_PROCESSORS_INTERFACE = [
@@ -75,14 +76,29 @@ def set_frame_processors_modules_from_ui(frame_processors: List[str]) -> None:
             except Exception as e:
                  print(f"Warning: Error removing frame processor {frame_processor}: {e}")
 
+def _suggest_workers() -> int:
+    """Return optimal ThreadPoolExecutor worker count based on the active provider.
+
+    GPU providers serialize inference through a binary THREAD_SEMAPHORE in each
+    processor, so adding more Python threads only wastes scheduler overhead.
+    For CPU, limit workers so that ONNX intra-op threads don't over-subscribe.
+    """
+    providers = modules.globals.execution_providers or []
+    gpu_providers = ("CUDAExecutionProvider", "DmlExecutionProvider", "ROCMExecutionProvider")
+    if any(p in providers for p in gpu_providers):
+        return 1
+
+    threads = modules.globals.execution_threads or (os.cpu_count() or 4)
+    cpu_count = os.cpu_count() or 4
+    return min(threads, max(2, cpu_count // 2))
+
+
 def multi_process_frame(source_path: str, temp_frame_paths: List[str], process_frames: Callable[[str, List[str], Any], None], progress: Any = None) -> None:
-    """Process frames in parallel with optimized batching and memory management."""
-    max_workers = modules.globals.execution_threads
-    
-    # Determine optimal batch size based on available memory and thread count
-    # Process frames in batches to avoid memory overflow
+    """Process frames in parallel with provider-aware concurrency and memory management."""
+    max_workers = _suggest_workers()
+
     batch_size = max(1, min(32, len(temp_frame_paths) // max(1, max_workers)))
-    
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Process in batches to manage memory better
         for i in range(0, len(temp_frame_paths), batch_size):
